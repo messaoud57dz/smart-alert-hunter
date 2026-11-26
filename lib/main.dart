@@ -44,7 +44,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
     try {
       final response = await http.get(
-        Uri.parse('https://data-api.binance.vision/api/v3/ticker/24hr'),
+        https://data-api.binance.vision/api/v3/ticker/24hr
       ).timeout(const Duration(seconds: 20));
 
       if (response.statusCode != 200) {
