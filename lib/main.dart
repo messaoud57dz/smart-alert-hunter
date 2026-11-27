@@ -1,5 +1,6 @@
 
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
@@ -41,8 +42,24 @@ class ObZone {
   final double low;
   final double high;
   final double distance;
+  final bool breaker;
 
-  ObZone(this.low, this.high, this.distance);
+  ObZone(
+    this.low,
+    this.high,
+    this.distance, {
+    this.breaker = false,
+  });
+}
+
+// ICT Bullish Order Block داخلي
+class _IctOb {
+  final double top;
+  final double bottom;
+  bool breaker;
+
+  _IctOb(this.top, this.bottom)
+      : breaker = false;
 }
 
 class CoinAnalysisResult {
@@ -73,15 +90,16 @@ class _ScannerPageState extends State<ScannerPage> {
 
   List<Coin> coins = [];
 
-  // مناطق الطلب اليومية 1D
   final Map<String, ObZone?> obZones1D = {};
-
-  // مناطق الطلب لأربع ساعات 4H
   final Map<String, ObZone?> obZones4H = {};
 
   final Set<String> analyzedSymbols = {};
 
-  // فحص السوق: الشروط الأصلية دون تغيير
+  // إعدادات ICT الأصلية للـ OB
+  static const int swingLookback = 10;
+  static const int candleLimit = 1000;
+
+  // فحص السوق - الشروط الأصلية دون تغيير
   Future<void> scan() async {
     setState(() {
       loading = true;
@@ -126,7 +144,9 @@ class _ScannerPageState extends State<ScannerPage> {
         if (price > 0 &&
             price <= 1 &&
             volume >= 500000) {
-          found.add(Coin(symbol, price, volume));
+          found.add(
+            Coin(symbol, price, volume),
+          );
         }
       }
 
@@ -151,119 +171,197 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // حساب المتوسط الأسي EMA
-  double calculateEma(List<double> values, int period) {
-    if (values.length < period) return 0;
+  // =====================================================
+  // ICT CONCEPTS - LUXALGO
+  // Bullish Order Block Algorithm
+  // Swing Lookback = 10
+  // Use Candle Body = true
+  // Show Last Bullish OB = 1
+  // =====================================================
 
-    double ema = values
-        .take(period)
-        .reduce((a, b) => a + b) / period;
-
-    final multiplier = 2 / (period + 1);
-
-    for (int i = period; i < values.length; i++) {
-      ema = (values[i] - ema) * multiplier + ema;
-    }
-
-    return ema;
-  }
-
-  // اكتشاف Bullish Order Block
-  // تستخدم نفس الخوارزمية على 1D و 4H
   ObZone? findBullishOb(
     List<Candle> candles,
     double currentPrice,
   ) {
-    if (candles.length < 60) return null;
-
-    final closes = candles.map((c) => c.close).toList();
-
-    final ema20 = calculateEma(closes, 20);
-    final ema50 = calculateEma(closes, 50);
-
-    // فلتر الاتجاه الصاعد
-    if (ema20 <= ema50 || closes.last <= ema20) {
+    if (candles.length < swingLookback + 5) {
       return null;
     }
 
-    ObZone? bestZone;
+    int os = 0;
 
-    for (int i = 10; i < candles.length - 3; i++) {
-      final ob = candles[i];
+    double? swingTop;
+    int? swingTopIndex;
+    bool swingTopCrossed = false;
 
-      // شمعة هابطة قبل الحركة الصاعدة
-      if (ob.close >= ob.open) continue;
+    // ترتيب المناطق: الأحدث أولاً
+    final bullishObs = <_IctOb>[];
 
-      double previousHigh = 0;
-      double averageBody = 0;
+    for (int i = 0; i < candles.length; i++) {
 
-      for (int j = i - 10; j < i; j++) {
-        if (candles[j].high > previousHigh) {
-          previousHigh = candles[j].high;
+      // -----------------------------------------------
+      // 1. Swing High / Swing Low
+      // مطابق لمنطق swings(length) في ICT
+      // -----------------------------------------------
+
+      if (i >= swingLookback) {
+        final pivotIndex = i - swingLookback;
+        final windowStart = i - swingLookback + 1;
+
+        double upper = candles[windowStart].high;
+        double lower = candles[windowStart].low;
+
+        for (int j = windowStart + 1; j <= i; j++) {
+          upper = math.max(upper, candles[j].high);
+          lower = math.min(lower, candles[j].low);
         }
 
-        averageBody +=
-            (candles[j].close - candles[j].open).abs();
-      }
+        int newOs = os;
 
-      averageBody /= 10;
-
-      int? impulseIndex;
-
-      // البحث عن حركة صاعدة قوية خلال 3 شموع
-      for (int j = i + 1;
-          j <= i + 3 && j < candles.length;
-          j++) {
-        final candle = candles[j];
-        final body = candle.close - candle.open;
-
-        if (body > 0 &&
-            candle.close > previousHigh &&
-            body >= averageBody * 1.5) {
-          impulseIndex = j;
-          break;
+        if (candles[pivotIndex].high > upper) {
+          newOs = 0;
+        } else if (candles[pivotIndex].low < lower) {
+          newOs = 1;
         }
-      }
 
-      if (impulseIndex == null) continue;
-
-      // إبطال المنطقة عند الإغلاق أسفل حدها السفلي
-      bool broken = false;
-
-      for (int j = impulseIndex + 1;
-          j < candles.length;
-          j++) {
-        if (candles[j].close < ob.low) {
-          broken = true;
-          break;
+        // تكوين Swing High جديد
+        if (newOs == 0 && os != 0) {
+          swingTop = candles[pivotIndex].high;
+          swingTopIndex = pivotIndex;
+          swingTopCrossed = false;
         }
+
+        os = newOs;
       }
 
-      if (broken) continue;
+      final candle = candles[i];
 
-      // المناطق أسفل السعر الحالي فقط
-      if (currentPrice <= ob.high) continue;
+      // -----------------------------------------------
+      // 2. Bullish BOS
+      // إغلاق السعر فوق Swing High
+      // -----------------------------------------------
 
-      final distance =
-          ((currentPrice - ob.high) / currentPrice) * 100;
+      if (swingTop != null &&
+          swingTopIndex != null &&
+          !swingTopCrossed &&
+          candle.close > swingTop) {
 
-      final zone = ObZone(
-        ob.low,
-        ob.high,
-        distance,
-      );
+        swingTopCrossed = true;
 
-      // اختيار أقرب منطقة صالحة أسفل السعر
-      if (bestZone == null ||
-          zone.high > bestZone.high) {
-        bestZone = zone;
+        // ---------------------------------------------
+        // 3. تحديد شمعة Order Block
+        // Use Candle Body = true
+        //
+        // البحث عن أدنى جسم شمعة من آخر شمعة
+        // حتى شمعة Swing High، دون تضمينها
+        // ---------------------------------------------
+
+        final previousIndex = i - 1;
+
+        double minimumBody = math.min(
+          candles[previousIndex].open,
+          candles[previousIndex].close,
+        );
+
+        double maximumBody = math.max(
+          candles[previousIndex].open,
+          candles[previousIndex].close,
+        );
+
+        for (int j = previousIndex;
+            j > swingTopIndex;
+            j--) {
+
+          final bodyLow = math.min(
+            candles[j].open,
+            candles[j].close,
+          );
+
+          final bodyHigh = math.max(
+            candles[j].open,
+            candles[j].close,
+          );
+
+          if (bodyLow <= minimumBody) {
+            minimumBody = bodyLow;
+            maximumBody = bodyHigh;
+          }
+        }
+
+        // إضافة أحدث OB في بداية القائمة
+        bullishObs.insert(
+          0,
+          _IctOb(
+            maximumBody,
+            minimumBody,
+          ),
+        );
+      }
+
+      // -----------------------------------------------
+      // 4. إبطال OB وتحويلها إلى Breaker
+      // مطابق لمنطق LuxAlgo
+      // -----------------------------------------------
+
+      for (int j = bullishObs.length - 1;
+          j >= 0;
+          j--) {
+
+        final element = bullishObs[j];
+
+        if (!element.breaker) {
+
+          // اختراق جسم الشمعة للحد السفلي
+          final bodyLow = math.min(
+            candle.close,
+            candle.open,
+          );
+
+          if (bodyLow < element.bottom) {
+            element.breaker = true;
+          }
+
+        } else {
+
+          // إزالة Breaker عند الإغلاق فوق حدها العلوي
+          if (candle.close > element.top) {
+            bullishObs.removeAt(j);
+          }
+        }
       }
     }
 
-    return bestZone;
+    // -----------------------------------------------
+    // 5. Show Last Bullish OB = 1
+    // اعتماد أحدث منطقة فقط
+    // -----------------------------------------------
+
+    if (bullishObs.isEmpty) {
+      return null;
+    }
+
+    final latest = bullishObs.first;
+
+    // المحافظة على شرط التطبيق:
+    // المنطقة يجب أن تكون أسفل السعر الحالي
+    if (currentPrice <= latest.top) {
+      return null;
+    }
+
+    final distance =
+        ((currentPrice - latest.top) / currentPrice) * 100;
+
+    return ObZone(
+      latest.bottom,
+      latest.top,
+      distance,
+      breaker: latest.breaker,
+    );
   }
 
-  // تحميل الشموع وتحليل الفريم المطلوب
+  // =====================================================
+  // تحميل الشموع وتحليل الفريم
+  // =====================================================
+
   Future<ObZone?> analyzeCoin(
     Coin coin,
     String interval,
@@ -275,12 +373,12 @@ class _ScannerPageState extends State<ScannerPage> {
         {
           'symbol': coin.symbol,
           'interval': interval,
-          'limit': '100',
+          'limit': '$candleLimit',
         },
       );
 
       final response = await http.get(uri).timeout(
-        const Duration(seconds: 15),
+        const Duration(seconds: 20),
       );
 
       if (response.statusCode != 200) {
@@ -302,12 +400,16 @@ class _ScannerPageState extends State<ScannerPage> {
         candles,
         coin.price,
       );
+
     } catch (_) {
       return null;
     }
   }
 
-  // تحليل 1D و 4H لكل عملة
+  // =====================================================
+  // تحليل 1D و 4H
+  // =====================================================
+
   Future<void> analyzeOrderBlocks() async {
     if (coins.isEmpty || analyzing) return;
 
@@ -316,15 +418,14 @@ class _ScannerPageState extends State<ScannerPage> {
       obZones1D.clear();
       obZones4H.clear();
       analyzedSymbols.clear();
-      status = 'جارٍ تحليل مناطق الطلب 1D و 4H...';
+      status = 'جارٍ تحليل ICT Order Blocks على 1D و4H...';
     });
 
     try {
-      // 3 عملات في كل دفعة
-      // كل عملة ترسل طلبين: 1D و 4H
       const batchSize = 3;
 
       for (int i = 0; i < coins.length; i += batchSize) {
+
         final end = (i + batchSize < coins.length)
             ? i + batchSize
             : coins.length;
@@ -334,6 +435,7 @@ class _ScannerPageState extends State<ScannerPage> {
         final results =
             await Future.wait<CoinAnalysisResult>(
           batch.map((coin) async {
+
             final zones = await Future.wait<ObZone?>([
               analyzeCoin(coin, '1d'),
               analyzeCoin(coin, '4h'),
@@ -361,17 +463,21 @@ class _ScannerPageState extends State<ScannerPage> {
           }
 
           final valid1D = obZones1D.values
-              .where((zone) => zone != null)
+              .where(
+                (zone) => zone != null && !zone.breaker,
+              )
               .length;
 
           final valid4H = obZones4H.values
-              .where((zone) => zone != null)
+              .where(
+                (zone) => zone != null && !zone.breaker,
+              )
               .length;
 
           status =
               'تم تحليل ${analyzedSymbols.length} من ${coins.length} زوجاً'
-              ' | مناطق 1D: $valid1D'
-              ' | مناطق 4H: $valid4H';
+              ' | ICT OB 1D: $valid1D'
+              ' | ICT OB 4H: $valid4H';
         });
       }
     } catch (e) {
@@ -384,7 +490,10 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // عرض تفاصيل منطقة الطلب
+  // =====================================================
+  // عرض معلومات المنطقة
+  // =====================================================
+
   Widget buildZoneInfo(
     String timeframe,
     ObZone? zone,
@@ -399,9 +508,7 @@ class _ScannerPageState extends State<ScannerPage> {
       return Padding(
         padding: const EdgeInsets.only(top: 5),
         child: Text(
-          timeframe == '1D'
-              ? 'لا يوجد OB يومي صالح'
-              : 'لا يوجد OB صالح على 4H',
+          'لا يوجد ICT OB صالح على $timeframe',
           style: const TextStyle(
             color: Colors.grey,
           ),
@@ -409,30 +516,52 @@ class _ScannerPageState extends State<ScannerPage> {
       );
     }
 
+    final zoneColor =
+        zone.breaker ? Colors.orange : color;
+
+    final zoneTitle = zone.breaker
+        ? 'ICT Breaker ($timeframe)'
+        : 'ICT Bullish OB ($timeframe)';
+
     return Padding(
       padding: const EdgeInsets.only(top: 5),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(
-            'Bullish OB ($timeframe): '
+            '$zoneTitle: '
             '${zone.low} - ${zone.high}',
             style: TextStyle(
-              color: color,
+              color: zoneColor,
               fontWeight: FontWeight.bold,
             ),
           ),
+
           Text(
-            'البعد عن منطقة $timeframe: '
+            zone.breaker
+                ? 'المنطقة مكسورة - ليست OB صالحة للشراء'
+                : 'منطقة طلب صالحة وفق شروط ICT',
+            style: TextStyle(
+              color: zoneColor,
+              fontSize: 12,
+            ),
+          ),
+
+          Text(
+            'البعد عن المنطقة: '
             '${zone.distance.toStringAsFixed(2)}%',
             style: TextStyle(
-              color: color,
+              color: zoneColor,
             ),
           ),
         ],
       ),
     );
   }
+
+  // =====================================================
+  // واجهة التطبيق
+  // =====================================================
 
   @override
   Widget build(BuildContext context) => Directionality(
@@ -441,33 +570,47 @@ class _ScannerPageState extends State<ScannerPage> {
       appBar: AppBar(
         title: const Text('Smart Alert Hunter V2'),
       ),
+
       body: Padding(
         padding: const EdgeInsets.all(16),
+
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+
             const Card(
               child: Padding(
                 padding: EdgeInsets.all(14),
+
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
+
                   children: [
                     Text(
-                      'ماسح Binance Spot',
+                      'ماسح Binance Spot - ICT',
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
                       ),
                     ),
+
                     Text(
                       '• أزواج USDT فقط\n'
                       '• السعر لا يتجاوز 1 USDT\n'
                       '• حجم تداول 24 ساعة لا يقل عن 500,000 USDT\n'
-                      '• تحليل Bullish Order Block على 1D\n'
-                      '• تحليل Bullish Order Block على 4H\n'
+                      '• اكتشاف ICT Bullish OB على 1D\n'
+                      '• اكتشاف ICT Bullish OB على 4H\n'
+                      '• Swing Lookback = 10\n'
+                      '• Use Candle Body = true\n'
+                      '• أحدث منطقة OB فقط\n'
+                      '• لا يوجد فلتر EMA\n'
+                      '• تمييز المناطق المكسورة Breaker\n'
                       'هذه قائمة تصفية وتحليل أولي وليست إشارة شراء.',
+
                       style: TextStyle(height: 1.6),
                     ),
+
                     SizedBox(height: 8),
+
                     Row(
                       children: [
                         Icon(
@@ -477,7 +620,9 @@ class _ScannerPageState extends State<ScannerPage> {
                         ),
                         SizedBox(width: 5),
                         Text('1D - يومي'),
+
                         SizedBox(width: 18),
+
                         Icon(
                           Icons.circle,
                           color: Colors.blue,
@@ -487,6 +632,20 @@ class _ScannerPageState extends State<ScannerPage> {
                         Text('4H - أربع ساعات'),
                       ],
                     ),
+
+                    SizedBox(height: 5),
+
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.circle,
+                          color: Colors.orange,
+                          size: 12,
+                        ),
+                        SizedBox(width: 5),
+                        Text('Breaker - منطقة مكسورة'),
+                      ],
+                    ),
                   ],
                 ),
               ),
@@ -494,9 +653,13 @@ class _ScannerPageState extends State<ScannerPage> {
 
             FilledButton.icon(
               onPressed: loading || analyzing ? null : scan,
+
               icon: const Icon(Icons.refresh),
+
               label: Text(
-                loading ? 'جارٍ الفحص...' : 'فحص السوق الآن',
+                loading
+                    ? 'جارٍ الفحص...'
+                    : 'فحص السوق الآن',
               ),
             ),
 
@@ -508,11 +671,13 @@ class _ScannerPageState extends State<ScannerPage> {
                       analyzing
                   ? null
                   : analyzeOrderBlocks,
+
               icon: const Icon(Icons.analytics_outlined),
+
               label: Text(
                 analyzing
-                    ? 'جارٍ تحليل OB...'
-                    : 'تحليل مناطق الطلب 1D + 4H',
+                    ? 'جارٍ تحليل ICT OB...'
+                    : 'تحليل مناطق ICT OB 1D + 4H',
               ),
             ),
 
@@ -537,10 +702,13 @@ class _ScannerPageState extends State<ScannerPage> {
                         'لا توجد نتائج معروضة حالياً',
                       ),
                     )
+
                   : ListView.separated(
                       itemCount: coins.length,
+
                       separatorBuilder: (_, __) =>
                           const Divider(height: 1),
+
                       itemBuilder: (context, index) {
                         final c = coins[index];
 
@@ -557,6 +725,7 @@ class _ScannerPageState extends State<ScannerPage> {
                           title: Text(
                             c.symbol,
                             textDirection: TextDirection.ltr,
+
                             style: const TextStyle(
                               fontWeight: FontWeight.bold,
                             ),
@@ -565,13 +734,13 @@ class _ScannerPageState extends State<ScannerPage> {
                           subtitle: Column(
                             crossAxisAlignment:
                                 CrossAxisAlignment.start,
+
                             children: [
                               Text(
                                 'حجم 24 ساعة: '
                                 '${c.volume.toStringAsFixed(0)} USDT',
                               ),
 
-                              // منطقة الطلب اليومية باللون الأخضر
                               buildZoneInfo(
                                 '1D',
                                 zone1D,
@@ -579,7 +748,6 @@ class _ScannerPageState extends State<ScannerPage> {
                                 wasAnalyzed,
                               ),
 
-                              // منطقة الطلب لأربع ساعات باللون الأزرق
                               buildZoneInfo(
                                 '4H',
                                 zone4H,
@@ -592,6 +760,7 @@ class _ScannerPageState extends State<ScannerPage> {
                           trailing: Text(
                             c.price.toStringAsFixed(6),
                             textDirection: TextDirection.ltr,
+
                             style: const TextStyle(
                               fontWeight: FontWeight.bold,
                             ),
@@ -604,7 +773,9 @@ class _ScannerPageState extends State<ScannerPage> {
             const Text(
               'تنبيه: لا ينفذ التطبيق صفقات ولا يضمن الربح. '
               'تحقق من التحليل قبل اتخاذ أي قرار.',
+
               textAlign: TextAlign.center,
+
               style: TextStyle(
                 fontSize: 11,
                 color: Colors.grey,
