@@ -107,7 +107,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
         if (price > 0 &&
             price <= 1 &&
-            volume >= 1000000) {
+            volume >= 500000) {
           found.add(Coin(symbol, price, volume));
         }
       }
@@ -360,7 +360,7 @@ class _ScannerPageState extends State<ScannerPage> {
                   'ماسح Binance Spot\n'
                   '• أزواج USDT فقط\n'
                   '• السعر لا يتجاوز 1 USDT\n'
-                  '• حجم تداول 24 ساعة لا يقل عن 1,000,000 USDT\n'
+                  '• حجم تداول 24 ساعة لا يقل عن 500,000 USDT\n'
                   '• تحليل Bullish Order Block على 1D\n'
                   'هذه قائمة تصفية وتحليل أولي وليست إشارة شراء.',
                   style: TextStyle(height: 1.6),
