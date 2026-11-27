@@ -45,6 +45,18 @@ class ObZone {
   ObZone(this.low, this.high, this.distance);
 }
 
+class CoinAnalysisResult {
+  final String symbol;
+  final ObZone? dailyZone;
+  final ObZone? fourHourZone;
+
+  CoinAnalysisResult(
+    this.symbol,
+    this.dailyZone,
+    this.fourHourZone,
+  );
+}
+
 class ScannerPage extends StatefulWidget {
   const ScannerPage({super.key});
 
@@ -61,14 +73,20 @@ class _ScannerPageState extends State<ScannerPage> {
 
   List<Coin> coins = [];
 
-  final Map<String, ObZone?> obZones = {};
+  // مناطق الطلب اليومية 1D
+  final Map<String, ObZone?> obZones1D = {};
+
+  // مناطق الطلب لأربع ساعات 4H
+  final Map<String, ObZone?> obZones4H = {};
+
   final Set<String> analyzedSymbols = {};
 
-  // الفحص الأساسي: نفس الشروط الأصلية
+  // فحص السوق: الشروط الأصلية دون تغيير
   Future<void> scan() async {
     setState(() {
       loading = true;
-      obZones.clear();
+      obZones1D.clear();
+      obZones4H.clear();
       analyzedSymbols.clear();
       status = 'جارٍ الاتصال بـ Binance...';
     });
@@ -150,7 +168,8 @@ class _ScannerPageState extends State<ScannerPage> {
     return ema;
   }
 
-  // اكتشاف منطقة Bullish OB اليومية
+  // اكتشاف Bullish Order Block
+  // تستخدم نفس الخوارزمية على 1D و 4H
   ObZone? findBullishOb(
     List<Candle> candles,
     double currentPrice,
@@ -208,7 +227,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
       if (impulseIndex == null) continue;
 
-      // رفض المنطقة إذا كُسرت بإغلاق يومي أسفلها
+      // إبطال المنطقة عند الإغلاق أسفل حدها السفلي
       bool broken = false;
 
       for (int j = impulseIndex + 1;
@@ -222,7 +241,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
       if (broken) continue;
 
-      // عرض المناطق الواقعة أسفل السعر فقط
+      // المناطق أسفل السعر الحالي فقط
       if (currentPrice <= ob.high) continue;
 
       final distance =
@@ -234,7 +253,7 @@ class _ScannerPageState extends State<ScannerPage> {
         distance,
       );
 
-      // اختيار أقرب منطقة طلب صالحة أسفل السعر
+      // اختيار أقرب منطقة صالحة أسفل السعر
       if (bestZone == null ||
           zone.high > bestZone.high) {
         bestZone = zone;
@@ -244,9 +263,10 @@ class _ScannerPageState extends State<ScannerPage> {
     return bestZone;
   }
 
-  // تحميل الشموع اليومية وتحليل العملة
-  Future<MapEntry<String, ObZone?>> analyzeCoin(
+  // تحميل الشموع وتحليل الفريم المطلوب
+  Future<ObZone?> analyzeCoin(
     Coin coin,
+    String interval,
   ) async {
     try {
       final uri = Uri.https(
@@ -254,7 +274,7 @@ class _ScannerPageState extends State<ScannerPage> {
         '/api/v3/klines',
         {
           'symbol': coin.symbol,
-          'interval': '1d',
+          'interval': interval,
           'limit': '100',
         },
       );
@@ -264,7 +284,7 @@ class _ScannerPageState extends State<ScannerPage> {
       );
 
       if (response.statusCode != 200) {
-        return MapEntry(coin.symbol, null);
+        return null;
       }
 
       final data = jsonDecode(response.body) as List;
@@ -278,30 +298,31 @@ class _ScannerPageState extends State<ScannerPage> {
         );
       }).toList();
 
-      final zone = findBullishOb(
+      return findBullishOb(
         candles,
         coin.price,
       );
-
-      return MapEntry(coin.symbol, zone);
     } catch (_) {
-      return MapEntry(coin.symbol, null);
+      return null;
     }
   }
 
-  // تحليل العملات على دفعات لتقليل ضغط الطلبات
+  // تحليل 1D و 4H لكل عملة
   Future<void> analyzeOrderBlocks() async {
     if (coins.isEmpty || analyzing) return;
 
     setState(() {
       analyzing = true;
-      obZones.clear();
+      obZones1D.clear();
+      obZones4H.clear();
       analyzedSymbols.clear();
-      status = 'جارٍ تحليل مناطق الطلب اليومية...';
+      status = 'جارٍ تحليل مناطق الطلب 1D و 4H...';
     });
 
     try {
-      const batchSize = 5;
+      // 3 عملات في كل دفعة
+      // كل عملة ترسل طلبين: 1D و 4H
+      const batchSize = 3;
 
       for (int i = 0; i < coins.length; i += batchSize) {
         final end = (i + batchSize < coins.length)
@@ -310,25 +331,47 @@ class _ScannerPageState extends State<ScannerPage> {
 
         final batch = coins.sublist(i, end);
 
-        final results = await Future.wait(
-          batch.map(analyzeCoin),
+        final results =
+            await Future.wait<CoinAnalysisResult>(
+          batch.map((coin) async {
+            final zones = await Future.wait<ObZone?>([
+              analyzeCoin(coin, '1d'),
+              analyzeCoin(coin, '4h'),
+            ]);
+
+            return CoinAnalysisResult(
+              coin.symbol,
+              zones[0],
+              zones[1],
+            );
+          }),
         );
 
         if (!mounted) return;
 
         setState(() {
           for (final result in results) {
-            obZones[result.key] = result.value;
-            analyzedSymbols.add(result.key);
+            obZones1D[result.symbol] =
+                result.dailyZone;
+
+            obZones4H[result.symbol] =
+                result.fourHourZone;
+
+            analyzedSymbols.add(result.symbol);
           }
 
-          final validCount = obZones.values
+          final valid1D = obZones1D.values
+              .where((zone) => zone != null)
+              .length;
+
+          final valid4H = obZones4H.values
               .where((zone) => zone != null)
               .length;
 
           status =
-              'تم تحليل ${analyzedSymbols.length} من ${coins.length} '
-              'زوجاً | مناطق صالحة: $validCount';
+              'تم تحليل ${analyzedSymbols.length} من ${coins.length} زوجاً'
+              ' | مناطق 1D: $valid1D'
+              ' | مناطق 4H: $valid4H';
         });
       }
     } catch (e) {
@@ -339,6 +382,56 @@ class _ScannerPageState extends State<ScannerPage> {
         setState(() => analyzing = false);
       }
     }
+  }
+
+  // عرض تفاصيل منطقة الطلب
+  Widget buildZoneInfo(
+    String timeframe,
+    ObZone? zone,
+    Color color,
+    bool wasAnalyzed,
+  ) {
+    if (zone == null) {
+      if (!wasAnalyzed) {
+        return const SizedBox.shrink();
+      }
+
+      return Padding(
+        padding: const EdgeInsets.only(top: 5),
+        child: Text(
+          timeframe == '1D'
+              ? 'لا يوجد OB يومي صالح'
+              : 'لا يوجد OB صالح على 4H',
+          style: const TextStyle(
+            color: Colors.grey,
+          ),
+        ),
+      );
+    }
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 5),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Bullish OB ($timeframe): '
+            '${zone.low} - ${zone.high}',
+            style: TextStyle(
+              color: color,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          Text(
+            'البعد عن منطقة $timeframe: '
+            '${zone.distance.toStringAsFixed(2)}%',
+            style: TextStyle(
+              color: color,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -356,14 +449,45 @@ class _ScannerPageState extends State<ScannerPage> {
             const Card(
               child: Padding(
                 padding: EdgeInsets.all(14),
-                child: Text(
-                  'ماسح Binance Spot\n'
-                  '• أزواج USDT فقط\n'
-                  '• السعر لا يتجاوز 1 USDT\n'
-                  '• حجم تداول 24 ساعة لا يقل عن 500,000 USDT\n'
-                  '• تحليل Bullish Order Block على 1D\n'
-                  'هذه قائمة تصفية وتحليل أولي وليست إشارة شراء.',
-                  style: TextStyle(height: 1.6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'ماسح Binance Spot',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      '• أزواج USDT فقط\n'
+                      '• السعر لا يتجاوز 1 USDT\n'
+                      '• حجم تداول 24 ساعة لا يقل عن 500,000 USDT\n'
+                      '• تحليل Bullish Order Block على 1D\n'
+                      '• تحليل Bullish Order Block على 4H\n'
+                      'هذه قائمة تصفية وتحليل أولي وليست إشارة شراء.',
+                      style: TextStyle(height: 1.6),
+                    ),
+                    SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.circle,
+                          color: Colors.green,
+                          size: 12,
+                        ),
+                        SizedBox(width: 5),
+                        Text('1D - يومي'),
+                        SizedBox(width: 18),
+                        Icon(
+                          Icons.circle,
+                          color: Colors.blue,
+                          size: 12,
+                        ),
+                        SizedBox(width: 5),
+                        Text('4H - أربع ساعات'),
+                      ],
+                    ),
+                  ],
                 ),
               ),
             ),
@@ -388,7 +512,7 @@ class _ScannerPageState extends State<ScannerPage> {
               label: Text(
                 analyzing
                     ? 'جارٍ تحليل OB...'
-                    : 'تحليل مناطق الطلب OB',
+                    : 'تحليل مناطق الطلب 1D + 4H',
               ),
             ),
 
@@ -419,7 +543,13 @@ class _ScannerPageState extends State<ScannerPage> {
                           const Divider(height: 1),
                       itemBuilder: (context, index) {
                         final c = coins[index];
-                        final zone = obZones[c.symbol];
+
+                        final zone1D =
+                            obZones1D[c.symbol];
+
+                        final zone4H =
+                            obZones4H[c.symbol];
+
                         final wasAnalyzed =
                             analyzedSymbols.contains(c.symbol);
 
@@ -427,7 +557,11 @@ class _ScannerPageState extends State<ScannerPage> {
                           title: Text(
                             c.symbol,
                             textDirection: TextDirection.ltr,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
+
                           subtitle: Column(
                             crossAxisAlignment:
                                 CrossAxisAlignment.start,
@@ -437,31 +571,24 @@ class _ScannerPageState extends State<ScannerPage> {
                                 '${c.volume.toStringAsFixed(0)} USDT',
                               ),
 
-                              if (zone != null) ...[
-                                const SizedBox(height: 5),
-                                Text(
-                                  'Bullish OB: '
-                                  '${zone.low} - ${zone.high}',
-                                  style: const TextStyle(
-                                    color: Colors.green,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                                Text(
-                                  'البعد عن المنطقة: '
-                                  '${zone.distance.toStringAsFixed(2)}%',
-                                ),
-                              ] else if (wasAnalyzed) ...[
-                                const SizedBox(height: 5),
-                                const Text(
-                                  'لا يوجد OB يومي صالح',
-                                  style: TextStyle(
-                                    color: Colors.grey,
-                                  ),
-                                ),
-                              ],
+                              // منطقة الطلب اليومية باللون الأخضر
+                              buildZoneInfo(
+                                '1D',
+                                zone1D,
+                                Colors.green,
+                                wasAnalyzed,
+                              ),
+
+                              // منطقة الطلب لأربع ساعات باللون الأزرق
+                              buildZoneInfo(
+                                '4H',
+                                zone4H,
+                                Colors.blue,
+                                wasAnalyzed,
+                              ),
                             ],
                           ),
+
                           trailing: Text(
                             c.price.toStringAsFixed(6),
                             textDirection: TextDirection.ltr,
